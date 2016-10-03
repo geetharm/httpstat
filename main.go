@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -58,6 +59,7 @@ var (
 	saveOutput      bool
 	outputFile      string
 	showVersion     bool
+	clientCertFile  string
 
 	// number of redirects followed
 	redirectsFollowed int
@@ -69,20 +71,29 @@ const maxRedirects = 10
 
 func init() {
 	flag.StringVar(&httpMethod, "X", "GET", "HTTP method to use")
-	flag.StringVar(&postBody, "d", "", "the body of a POST or PUT request")
+	flag.StringVar(&postBody, "d", "", "the body of a POST or PUT request; from file use @filename")
 	flag.BoolVar(&followRedirects, "L", false, "follow 30x redirects")
 	flag.BoolVar(&onlyHeader, "I", false, "don't read body of request")
 	flag.BoolVar(&insecure, "k", false, "allow insecure SSL connections")
-	flag.Var(&httpHeaders, "H", "HTTP Header(s) to set. Can be used multiple times. -H 'Accept:...' -H 'Range:....'")
-	flag.BoolVar(&saveOutput, "O", false, "Save body as remote filename")
+	flag.Var(&httpHeaders, "H", "set HTTP header; repeatable: -H 'Accept: ...' -H 'Range: ...'")
+	flag.BoolVar(&saveOutput, "O", false, "save body as remote filename")
 	flag.StringVar(&outputFile, "o", "", "output file for body")
 	flag.BoolVar(&showVersion, "v", false, "print version number")
+	flag.StringVar(&clientCertFile, "E", "", "client cert file for tls config")
 
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s URL\n", os.Args[0])
-		flag.PrintDefaults()
-		os.Exit(2)
-	}
+	flag.Usage = usage
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] URL\n\n", os.Args[0])
+	fmt.Fprintln(os.Stderr, "OPTIONS:")
+	flag.PrintDefaults()
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "ENVIRONMENT:")
+	fmt.Fprintln(os.Stderr, "  HTTP_PROXY    proxy for HTTP requests; complete URL or HOST[:PORT]")
+	fmt.Fprintln(os.Stderr, "                used for HTTPS requests if HTTPS_PROXY undefined")
+	fmt.Fprintln(os.Stderr, "  HTTPS_PROXY   proxy for HTTPS requests; complete URL or HOST[:PORT]")
+	fmt.Fprintln(os.Stderr, "  NO_PROXY      comma-separated list of hosts to exclude from proxy")
 }
 
 func printf(format string, a ...interface{}) (n int, err error) {
@@ -104,6 +115,7 @@ func main() {
 	args := flag.Args()
 	if len(args) != 1 {
 		flag.Usage()
+		os.Exit(2)
 	}
 
 	if (httpMethod == "POST" || httpMethod == "PUT") && postBody == "" {
@@ -117,6 +129,45 @@ func main() {
 	url := parseURL(args[0])
 
 	visit(url)
+}
+
+// readClientCert - helper function to read client certificate
+// from pem formatted file
+func readClientCert(filename string) []tls.Certificate {
+	if filename == "" {
+		return nil
+	}
+	var (
+		pkeyPem []byte
+		certPem []byte
+	)
+
+	// read client certificate file (must include client private key and certificate)
+	certFileBytes, err := ioutil.ReadFile(clientCertFile)
+	if err != nil {
+		log.Fatalf("failed to read client certificate file: %v", err)
+	}
+
+	for {
+		block, rest := pem.Decode(certFileBytes)
+		if block == nil {
+			break
+		}
+		certFileBytes = rest
+
+		if strings.HasSuffix(block.Type, "PRIVATE KEY") {
+			pkeyPem = pem.EncodeToMemory(block)
+		}
+		if strings.HasSuffix(block.Type, "CERTIFICATE") {
+			certPem = pem.EncodeToMemory(block)
+		}
+	}
+
+	cert, err := tls.X509KeyPair(certPem, pkeyPem)
+	if err != nil {
+		log.Fatalf("unable to load client cert and key pair: %v", err)
+	}
+	return []tls.Certificate{cert}
 }
 
 func parseURL(uri string) *url.URL {
@@ -170,7 +221,7 @@ func visit(url *url.URL) {
 
 			printf("\n%s%s\n", color.GreenString("Connected to "), color.CyanString(addr))
 		},
-		WroteRequest:         func(_ httptrace.WroteRequestInfo) { t3 = time.Now() },
+		GotConn:              func(_ httptrace.GotConnInfo) { t3 = time.Now() },
 		GotFirstResponseByte: func() { t4 = time.Now() },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
@@ -185,14 +236,15 @@ func visit(url *url.URL) {
 
 	switch url.Scheme {
 	case "https":
-		host, _, err := net.SplitHostPort(url.Host)
+		host, _, err := net.SplitHostPort(req.Host)
 		if err != nil {
-			host = url.Host
+			host = req.Host
 		}
 
 		tr.TLSClientConfig = &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: insecure,
+			Certificates:       readClientCert(clientCertFile),
 		}
 
 		// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
@@ -370,10 +422,10 @@ func readResponseBody(req *http.Request, resp *http.Response) string {
 	w := ioutil.Discard
 	msg := color.CyanString("Body discarded")
 
-	if saveOutput == true || outputFile != "" {
+	if saveOutput || outputFile != "" {
 		filename := outputFile
 
-		if saveOutput == true {
+		if saveOutput {
 			// try to get the filename from the Content-Disposition header
 			// otherwise fall back to the RequestURI
 			if filename = getFilenameFromHeaders(resp.Header); filename == "" {
